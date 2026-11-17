@@ -106,10 +106,157 @@ done:
   ret void
 }
 
+; scanout_scale (fuxi, 2026-11-13): a BGRA frame of another size than the scanout (the display's logical mode, 1125x2500 on the 1080x2400
+; panel) resampled bilinearly into the scanout's rows with alpha 0xff, one thread per scanout pixel; the argument form of scanout_opaque.
+;   kernel void scanout_scale(device const uint *src [[buffer(0)]], device uint *dst [[buffer(1)]], constant uint4 &p [[buffer(3)]],
+;                             uint2 gid [[thread_position_in_grid]])
+; p.x = scanout width | source width << 16, p.y = scanout height | source height << 16, p.z = source pitch | scanout pitch << 16 (words),
+; p.w = x step | y step << 16 (source pixels per scanout pixel, Q15). Weights are 8-bit; the channels blend two at a time (0x00ff00ff lanes).
+define void @scanout_scale(ptr addrspace(1) noundef readonly "air-buffer-no-alias" %src, ptr addrspace(1) noundef "air-buffer-no-alias" %dst, ptr addrspace(2) noundef readonly align 16 dereferenceable(16) "air-buffer-no-alias" %p, <2 x i32> noundef %gid) local_unnamed_addr #0 {
+entry:
+  %px0 = load i32, ptr addrspace(2) %p, align 16
+  %pp1 = getelementptr inbounds i32, ptr addrspace(2) %p, i64 1
+  %px1 = load i32, ptr addrspace(2) %pp1, align 4
+  %pp2 = getelementptr inbounds i32, ptr addrspace(2) %p, i64 2
+  %px2 = load i32, ptr addrspace(2) %pp2, align 8
+  %pp3 = getelementptr inbounds i32, ptr addrspace(2) %p, i64 3
+  %px3 = load i32, ptr addrspace(2) %pp3, align 4
+  %w = and i32 %px0, 65535
+  %sw = lshr i32 %px0, 16
+  %h = and i32 %px1, 65535
+  %sh = lshr i32 %px1, 16
+  %ss = and i32 %px2, 65535
+  %ds = lshr i32 %px2, 16
+  %xs = and i32 %px3, 65535
+  %ys = lshr i32 %px3, 16
+  %x = extractelement <2 x i32> %gid, i64 0
+  %y = extractelement <2 x i32> %gid, i64 1
+  %inx = icmp ult i32 %x, %w
+  %iny = icmp ult i32 %y, %h
+  %in = and i1 %inx, %iny
+  br i1 %in, label %body, label %done
+
+body:
+  %fx0 = mul i32 %x, %xs
+  %xh = lshr i32 %xs, 1
+  %fx1 = add i32 %fx0, %xh
+  %fxp = icmp ugt i32 %fx1, 16384
+  %fx2 = sub i32 %fx1, 16384
+  %fx = select i1 %fxp, i32 %fx2, i32 0
+  %fy0 = mul i32 %y, %ys
+  %yh = lshr i32 %ys, 1
+  %fy1 = add i32 %fy0, %yh
+  %fyp = icmp ugt i32 %fy1, 16384
+  %fy2 = sub i32 %fy1, 16384
+  %fy = select i1 %fyp, i32 %fy2, i32 0
+  %swm = sub i32 %sw, 1
+  %shm = sub i32 %sh, 1
+  %xa0 = lshr i32 %fx, 15
+  %xac = icmp ugt i32 %xa0, %swm
+  %xa = select i1 %xac, i32 %swm, i32 %xa0
+  %xb0 = add i32 %xa, 1
+  %xbc = icmp ugt i32 %xb0, %swm
+  %xb = select i1 %xbc, i32 %swm, i32 %xb0
+  %ya0 = lshr i32 %fy, 15
+  %yac = icmp ugt i32 %ya0, %shm
+  %ya = select i1 %yac, i32 %shm, i32 %ya0
+  %yb0 = add i32 %ya, 1
+  %ybc = icmp ugt i32 %yb0, %shm
+  %yb = select i1 %ybc, i32 %shm, i32 %yb0
+  %wx7 = lshr i32 %fx, 7
+  %wx = and i32 %wx7, 255
+  %wy7 = lshr i32 %fy, 7
+  %wy = and i32 %wy7, 255
+  %iwx = sub i32 256, %wx
+  %iwy = sub i32 256, %wy
+  %ss64 = zext i32 %ss to i64
+  %ya64 = zext i32 %ya to i64
+  %yb64 = zext i32 %yb to i64
+  %xa64 = zext i32 %xa to i64
+  %xb64 = zext i32 %xb to i64
+  %ra = mul i64 %ya64, %ss64
+  %rb = mul i64 %yb64, %ss64
+  %i00 = add i64 %ra, %xa64
+  %i10 = add i64 %ra, %xb64
+  %i01 = add i64 %rb, %xa64
+  %i11 = add i64 %rb, %xb64
+  %a00 = getelementptr inbounds i32, ptr addrspace(1) %src, i64 %i00
+  %a10 = getelementptr inbounds i32, ptr addrspace(1) %src, i64 %i10
+  %a01 = getelementptr inbounds i32, ptr addrspace(1) %src, i64 %i01
+  %a11 = getelementptr inbounds i32, ptr addrspace(1) %src, i64 %i11
+  %p00 = load i32, ptr addrspace(1) %a00, align 4
+  %p10 = load i32, ptr addrspace(1) %a10, align 4
+  %p01 = load i32, ptr addrspace(1) %a01, align 4
+  %p11 = load i32, ptr addrspace(1) %a11, align 4
+  ; top row: p00 .. p10 by wx
+  %t_arb = and i32 %p00, 16711935
+  %t_brb = and i32 %p10, 16711935
+  %t_ag0 = lshr i32 %p00, 8
+  %t_ag = and i32 %t_ag0, 16711935
+  %t_bg0 = lshr i32 %p10, 8
+  %t_bg = and i32 %t_bg0, 16711935
+  %t_rb1 = mul i32 %t_arb, %iwx
+  %t_rb2 = mul i32 %t_brb, %wx
+  %t_rb3 = add i32 %t_rb1, %t_rb2
+  %t_rb4 = lshr i32 %t_rb3, 8
+  %t_rb = and i32 %t_rb4, 16711935
+  %t_g1 = mul i32 %t_ag, %iwx
+  %t_g2 = mul i32 %t_bg, %wx
+  %t_g3 = add i32 %t_g1, %t_g2
+  %t_g = and i32 %t_g3, -16711936
+  %top = or i32 %t_rb, %t_g
+  ; bottom row: p01 .. p11 by wx
+  %b_arb = and i32 %p01, 16711935
+  %b_brb = and i32 %p11, 16711935
+  %b_ag0 = lshr i32 %p01, 8
+  %b_ag = and i32 %b_ag0, 16711935
+  %b_bg0 = lshr i32 %p11, 8
+  %b_bg = and i32 %b_bg0, 16711935
+  %b_rb1 = mul i32 %b_arb, %iwx
+  %b_rb2 = mul i32 %b_brb, %wx
+  %b_rb3 = add i32 %b_rb1, %b_rb2
+  %b_rb4 = lshr i32 %b_rb3, 8
+  %b_rb = and i32 %b_rb4, 16711935
+  %b_g1 = mul i32 %b_ag, %iwx
+  %b_g2 = mul i32 %b_bg, %wx
+  %b_g3 = add i32 %b_g1, %b_g2
+  %b_g = and i32 %b_g3, -16711936
+  %bot = or i32 %b_rb, %b_g
+  ; vertical: top .. bot by wy
+  %v_arb = and i32 %top, 16711935
+  %v_brb = and i32 %bot, 16711935
+  %v_ag0 = lshr i32 %top, 8
+  %v_ag = and i32 %v_ag0, 16711935
+  %v_bg0 = lshr i32 %bot, 8
+  %v_bg = and i32 %v_bg0, 16711935
+  %v_rb1 = mul i32 %v_arb, %iwy
+  %v_rb2 = mul i32 %v_brb, %wy
+  %v_rb3 = add i32 %v_rb1, %v_rb2
+  %v_rb4 = lshr i32 %v_rb3, 8
+  %v_rb = and i32 %v_rb4, 16711935
+  %v_g1 = mul i32 %v_ag, %iwy
+  %v_g2 = mul i32 %v_bg, %wy
+  %v_g3 = add i32 %v_g1, %v_g2
+  %v_g = and i32 %v_g3, -16711936
+  %mix = or i32 %v_rb, %v_g
+  %px = or i32 %mix, -16777216
+  %x64 = zext i32 %x to i64
+  %y64 = zext i32 %y to i64
+  %ds64 = zext i32 %ds to i64
+  %drow = mul i64 %y64, %ds64
+  %di = add i64 %drow, %x64
+  %dp = getelementptr inbounds i32, ptr addrspace(1) %dst, i64 %di
+  store i32 %px, ptr addrspace(1) %dp, align 4
+  br label %done
+
+done:
+  ret void
+}
+
 attributes #0 = { mustprogress nofree norecurse nosync nounwind willreturn "frame-pointer"="all" "min-legal-vector-width"="0" "no-builtins" "no-trapping-math"="true" "stack-protector-buffer-size"="8" }
 
 !llvm.module.flags = !{!0, !1, !2, !3, !4, !5, !6, !7, !8}
-!air.kernel = !{!9, !22}
+!air.kernel = !{!9, !22, !26}
 !air.compile_options = !{!17, !18}
 !llvm.ident = !{!19}
 !air.version = !{!20}
@@ -141,3 +288,7 @@ attributes #0 = { mustprogress nofree norecurse nosync nounwind willreturn "fram
 !23 = !{!12, !13, !25, !24}
 !24 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"gid"}
 !25 = !{i32 2, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"uint4", !"air.arg_name", !"p"}
+!26 = !{ptr @scanout_scale, !10, !27}
+!27 = !{!12, !13, !25, !24}
+!28 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"q"}
+!29 = !{i32 4, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"gid"}

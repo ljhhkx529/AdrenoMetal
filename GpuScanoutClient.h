@@ -102,7 +102,9 @@ public:
         if (r == gpupresent::kOk && swap.format == NGP_BGRX8888 && stats_->verified < 4) verify(swap);
         note(0x6731);   // the GPU copy returned
         const uint64_t copiedUs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000;
-        NGPComplete done = {swap.sequence, r == gpupresent::kOk ? 0u : 0xe00002bcu /* kIOReturnError */, 0};
+        // fuxi (2026-11-13): the refusal's own result in the low bits, so the display driver can tell
+        // a refused format from a refused size (the logical mode's frames are scaled, not copied).
+        NGPComplete done = {swap.sequence, r == gpupresent::kOk ? 0u : 0xe00002b0u | (uint32_t)r, 0};
         const int completed = transport_.call(transport_.context, NGP_METHOD_COMPLETE_SWAP, &done, sizeof done, nullptr, 0);
         if (NBTraceSwap) NBTraceSwap(offeredUs, copiedUs, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000, (uint32_t)swap.sequence, (uint32_t)r);
         if (completed) {++stats_->failures; stats_->error = completed; return false;}

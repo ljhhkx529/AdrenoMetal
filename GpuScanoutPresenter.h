@@ -19,7 +19,6 @@
 // The conversion kernel's AIR and the frontend's loader for bare AIR (both in the plugin; weak, so a device without them only blits).
 extern "C" const void *nmb_scanout_convert_air(size_t *length) __attribute__((weak_import));
 extern "C" id native_bridge_metal_library_with_air(const void *bytes, size_t length) __attribute__((weak_import));
-
 namespace gpupresent {
 
 // Measurement only: when set, the copy covers the upper half of the rows (the GPU cost of the copy is what is being measured).
@@ -57,6 +56,7 @@ public:
         if (frame.format == NGP_RGBA16F_LINEAR || frame.format == NGP_RGBA16F_ENCODED) return convert(frame);
         if (frame.format != NGP_BGRX8888) return kBadFrame;
         const size_t page = (size_t)getpagesize(), row = (size_t)frame.width * 4;
+        if (frame.width != scanout_.width || frame.height != scanout_.height) return scale(frame);
         if (!frame.base || ((uintptr_t)frame.base & (page - 1)) || !frame.bytes || (frame.bytes & (page - 1)) ||
             frame.width != scanout_.width || frame.height != scanout_.height || frame.stride < row ||
             (size_t)frame.height > frame.bytes / frame.stride || frame.stride * (frame.height - 1) + row > frame.bytes) return kBadFrame;
@@ -102,6 +102,36 @@ public:
             }
         }
         [blit endEncoding];
+        [commands commit];
+        [commands waitUntilCompleted];
+        return commands.status == MTLCommandBufferStatusCompleted ? kOk : kGpuFailed;
+    }
+    // fuxi (2026-11-13): a BGRA frame of the display's logical mode (another size than the scanout, e.g. 1125x2500 on a 1080x2400 panel)
+    // resampled bilinearly into the scanout by scanout_scale, one thread per scanout pixel. Without the kernel the frame is refused and the
+    // display driver scales it itself.
+    Result scale(const Frame &frame) {
+        const size_t page = (size_t)getpagesize(), row = (size_t)frame.width * 4;
+        if (frame.format != NGP_BGRX8888 || !frame.base || ((uintptr_t)frame.base & (page - 1)) || !frame.bytes || (frame.bytes & (page - 1)) ||
+            !frame.width || !frame.height || frame.width > 8192 || frame.height > 8192 || frame.stride < row || (frame.stride & 3) ||
+            (scanout_.stride & 3) || frame.stride * (frame.height - 1) + row > frame.bytes) return kBadFrame;
+        if (!pipeline(scale_, scaleFailed_, @"scanout_scale")) return kNoResource;
+        id<MTLBuffer> source = sourceFor(frame);
+        if (!source) return kNoResource;
+        id<MTLCommandBuffer> commands = [queue_ commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = commands ? [commands computeCommandEncoder] : nil;
+        if (!encoder) return kNoResource;
+        // the 16-bit pairs of scanout_scale's p (its argument form is scanout_opaque's, the kernel proven here)
+        if (frame.stride / 4 > 65535 || scanout_.stride / 4 > 65535 || scanout_.width > 65535 || scanout_.height > 65535) return kBadFrame;
+        const uint32_t xs = (uint32_t)(((uint64_t)frame.width << 15) / scanout_.width), ys = (uint32_t)(((uint64_t)frame.height << 15) / scanout_.height);
+        if (xs > 65535 || ys > 65535) return kBadFrame;
+        const uint32_t params[4] = {scanout_.width | frame.width << 16, scanout_.height | frame.height << 16,
+                                    (uint32_t)(frame.stride / 4) | (uint32_t)(scanout_.stride / 4) << 16, xs | ys << 16};
+        [encoder setComputePipelineState:scale_];
+        [encoder setBuffer:source offset:0 atIndex:0];
+        [encoder setBuffer:target_ offset:0 atIndex:1];
+        [encoder setBytes:params length:sizeof params atIndex:3];
+        [encoder dispatchThreadgroups:MTLSizeMake((scanout_.width + 15) / 16, (scanout_.height + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+        [encoder endEncoding];
         [commands commit];
         [commands waitUntilCompleted];
         return commands.status == MTLCommandBufferStatusCompleted ? kOk : kGpuFailed;
@@ -187,8 +217,8 @@ private:
     Scanout scanout_;
     id<MTLCommandQueue> queue_;
     id<MTLBuffer> target_;
-    id<MTLComputePipelineState> convert_ = nil, opaque_ = nil;
-    bool convertFailed_ = false, opaqueFailed_ = false;
+    id<MTLComputePipelineState> convert_ = nil, opaque_ = nil, scale_ = nil;
+    bool convertFailed_ = false, opaqueFailed_ = false, scaleFailed_ = false;
     id<MTLBuffer> tables_[2] = {nil, nil};
     Source sources_[kSources] = {};
     uint64_t uses_ = 0;
